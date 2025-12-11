@@ -5,9 +5,10 @@ import numpy as np  # add at top
 from io import BytesIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from openpyxl import load_workbook  # ✅ NEW
+from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows   # ✅ NEW
 
 
 # ───── Streamlit setup ────────────────────────────────────────────────────────
@@ -289,7 +290,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ───── Generate Excel while keeping ALL sheets ────────────────────────────────
+# ───── Generate Excel while keeping ALL sheets (no ExcelWriter) ───────────────
 def generate_visitor_only(df: pd.DataFrame, uploaded_file) -> BytesIO:
     buf = BytesIO()
 
@@ -297,164 +298,161 @@ def generate_visitor_only(df: pd.DataFrame, uploaded_file) -> BytesIO:
     uploaded_file.seek(0)  # reset pointer after pd.read_excel
     wb = load_workbook(uploaded_file)
 
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        writer.book = wb
-        writer.sheets = {ws.title: ws for ws in wb.worksheets}
+    # Get or create Visitor List sheet
+    if "Visitor List" in wb.sheetnames:
+        ws = wb["Visitor List"]
+        # Clear existing contents
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("Visitor List")
 
-        # Remove existing Visitor List sheet (if any) and recreate it at same index
-        if "Visitor List" in writer.book.sheetnames:
-            idx = writer.book.sheetnames.index("Visitor List")
-            old_ws = writer.book["Visitor List"]
-            writer.book.remove(old_ws)
-            writer.book.create_sheet("Visitor List", idx)
-        else:
-            writer.book.create_sheet("Visitor List")
-        # refresh mapping and write cleaned data
-        writer.sheets = {ws.title: ws for ws in writer.book.worksheets}
-        df.to_excel(writer, index=False, sheet_name="Visitor List")
+    # Write DataFrame to sheet
+    for row in dataframe_to_rows(df, index=False, header=True):
+        ws.append(row)
 
-        # get the sheet we just wrote to
-        ws = writer.book["Visitor List"]
+    # === Everything below is your existing styling / validation on ws ===
 
-        header_fill  = PatternFill("solid", fgColor="94B455")
-        warning_fill = PatternFill("solid", fgColor="DA9694")  # existing "red"
-        border       = Border(*[Side("thin")]*4)
-        center       = Alignment("center","center")
-        normal_font  = Font(name="Calibri", size=9)
-        bold_font    = Font(name="Calibri", size=9, bold=True)
-        expired_fill = warning_fill                             # alias for clarity
-        soon_fill    = PatternFill("solid", fgColor="F9CB9C")   # orange for <1 month
+    header_fill  = PatternFill("solid", fgColor="94B455")
+    warning_fill = PatternFill("solid", fgColor="DA9694")  # existing "red"
+    border       = Border(*[Side("thin")]*4)
+    center       = Alignment("center","center")
+    normal_font  = Font(name="Calibri", size=9)
+    bold_font    = Font(name="Calibri", size=9, bold=True)
+    expired_fill = warning_fill                             # alias for clarity
+    soon_fill    = PatternFill("solid", fgColor="F9CB9C")   # orange for <1 month
 
-        # style all cells
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.border    = border
-                cell.alignment = center
-                cell.font      = normal_font
+    # style all cells
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border    = border
+            cell.alignment = center
+            cell.font      = normal_font
 
-        # header row
-        for col in range(1, ws.max_column + 1):
-            h = ws[f"{get_column_letter(col)}1"]
-            h.fill = header_fill
-            h.font = bold_font
-        ws.freeze_panes = "B2"
+    # header row
+    for col in range(1, ws.max_column + 1):
+        h = ws[f"{get_column_letter(col)}1"]
+        h.fill = header_fill
+        h.font = bold_font
+    ws.freeze_panes = "B2"
 
-        errors = 0
-        seen = {}                    # duplicate‐tracker
+    errors = 0
+    seen = {}                    # duplicate‐tracker
 
-        for r in range(2, ws.max_row + 1):
-            # pull values
-            idt = str(ws[f"G{r}"].value).strip().upper()
-            nat = str(ws[f"J{r}"].value).strip().title()
-            pr  = str(ws[f"K{r}"].value).strip().lower()
-            wpd = str(ws[f"I{r}"].value).strip()
-            name = str(ws[f"D{r}"].value or "").strip()   # “Full Name” from col D
+    for r in range(2, ws.max_row + 1):
+        # pull values
+        idt = str(ws[f"G{r}"].value).strip().upper()
+        nat = str(ws[f"J{r}"].value).strip().title()
+        pr  = str(ws[f"K{r}"].value).strip().lower()
+        wpd = str(ws[f"I{r}"].value).strip()
+        name = str(ws[f"D{r}"].value or "").strip()   # “Full Name” from col D
 
-            bad = False
+        bad = False
 
-            # ─── highlight expiry: red if expired, orange if ≤30 days ahead ───
-            expiry_str = str(ws[f"I{r}"].value).strip()
-            try:
-                expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-                today_sg = datetime.now(ZoneInfo("Asia/Singapore")).date()
-                cutoff = today_sg + timedelta(days=30)
+        # ─── highlight expiry: red if expired, orange if ≤30 days ahead ───
+        expiry_str = str(ws[f"I{r}"].value).strip()
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            today_sg = datetime.now(ZoneInfo("Asia/Singapore")).date()
+            cutoff = today_sg + timedelta(days=30)
 
-                if expiry_date < today_sg:
-                    # already expired → red
-                    ws[f"I{r}"].fill = expired_fill
-                    errors += 1
-                elif expiry_date <= cutoff:
-                    # expiring within 1 month → orange (#f9cb9c)
-                    ws[f"I{r}"].fill = soon_fill
-                    errors += 1
-
-            except ValueError:
-                # skip if not a valid date string
-                pass
-
-            # ── NEW RULE: Singaporeans cannot be PR ────────────────────────────
-            if nat == "Singapore" and pr == "pr":
-                bad = True
-
-            if idt != "NRIC" and pr == "pr": bad = True
-            if idt == "FIN" and (nat == "Singapore" or pr == "pr"): bad = True
-            if idt == "NRIC" and not (nat == "Singapore" or pr == "pr"): bad = True
-            if idt == "FIN" and not wpd: bad = True
-            if idt == "WP" and not wpd: bad = True
-
-            if bad:
-                # highlight the offending cells
-                for col in ("G","J","K","I"):
-                    ws[f"{col}{r}"].fill = warning_fill
+            if expiry_date < today_sg:
+                # already expired → red
+                ws[f"I{r}"].fill = expired_fill
+                errors += 1
+            elif expiry_date <= cutoff:
+                # expiring within 1 month → orange (#f9cb9c)
+                ws[f"I{r}"].fill = soon_fill
                 errors += 1
 
-            # ─── duplicate‐check on column D ──────────────────────────
-            if name:
-                if name in seen:
-                    # highlight both the old row and the new row
-                    ws[f"D{r}"].fill = warning_fill
-                    ws[f"D{seen[name]}"].fill = warning_fill
-                    errors += 1
-                else:
-                    seen[name] = r
+        except ValueError:
+            # skip if not a valid date string
+            pass
 
-        if errors:
-            st.warning(f"⚠️ {errors} validation error(s) found.")
+        # ── NEW RULE: Singaporeans cannot be PR ────────────────────────────
+        if nat == "Singapore" and pr == "pr":
+            bad = True
 
-        # Set fixed column widths
-        column_widths = {
-            "A": 3.38,
-            "C": 23.06,
-            "D": 17.25,
-            "E": 17.63,
-            "F": 26.25,
-            "G": 13.94,
-            "H": 24.06,
-            "I": 18.38,
-            "J": 20.31,
-            "K": 4,
-            "L": 5.81,
-            "M": 11.5,
-        }
-        # B is dynamic (auto-fit based on max content)
-        for col in ws.columns:
-            col_letter = get_column_letter(col[0].column)
-            if col_letter == "B":
-                width = max(len(str(cell.value)) for cell in col if cell.value)
-                ws.column_dimensions[col_letter].width = width
-            elif col_letter in column_widths:
-                ws.column_dimensions[col_letter].width = column_widths[col_letter]
+        if idt != "NRIC" and pr == "pr": bad = True
+        if idt == "FIN" and (nat == "Singapore" or pr == "pr"): bad = True
+        if idt == "NRIC" and not (nat == "Singapore" or pr == "pr"): bad = True
+        if idt == "FIN" and not wpd: bad = True
+        if idt == "WP" and not wpd: bad = True
 
-        for row in ws.iter_rows():
-            ws.row_dimensions[row[0].row].height = 16.8
+        if bad:
+            # highlight the offending cells
+            for col in ("G","J","K","I"):
+                ws[f"{col}{r}"].fill = warning_fill
+            errors += 1
 
-        # vehicles summary
-        plates = []
-        for v in df["Vehicle Plate Number"].dropna():
-            plates += [x.strip() for x in str(v).split(";") if x.strip()]
-        ins = ws.max_row + 2
-        if plates:
-            ws[f"B{ins}"].value = "Vehicles"
-            ws[f"B{ins}"].font = Font(size=9)
-            ws[f"B{ins}"].border = border
-            ws[f"B{ins}"].alignment = center
+        # ─── duplicate‐check on column D ──────────────────────────
+        if name:
+            if name in seen:
+                # highlight both the old row and the new row
+                ws[f"D{r}"].fill = warning_fill
+                ws[f"D{seen[name]}"].fill = warning_fill
+                errors += 1
+            else:
+                seen[name] = r
 
-            ws[f"B{ins+1}"].value = ",".join(sorted(set(plates)))
-            ws[f"B{ins+1}"].font = Font(size=9)
-            ws[f"B{ins+1}"].border = border
-            ws[f"B{ins+1}"].alignment = center
-            ins += 2
+    if errors:
+        st.warning(f"⚠️ {errors} validation error(s) found.")
 
-        ws[f"B{ins}"].value = "Total Visitors"
+    # Set fixed column widths
+    column_widths = {
+        "A": 3.38,
+        "C": 23.06,
+        "D": 17.25,
+        "E": 17.63,
+        "F": 26.25,
+        "G": 13.94,
+        "H": 24.06,
+        "I": 18.38,
+        "J": 20.31,
+        "K": 4,
+        "L": 5.81,
+        "M": 11.5,
+    }
+    # B is dynamic (auto-fit based on max content)
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        if col_letter == "B":
+            width = max(len(str(cell.value)) for cell in col if cell.value)
+            ws.column_dimensions[col_letter].width = width
+        elif col_letter in column_widths:
+            ws.column_dimensions[col_letter].width = column_widths[col_letter]
+
+    for row in ws.iter_rows():
+        ws.row_dimensions[row[0].row].height = 16.8
+
+    # vehicles summary
+    plates = []
+    for v in df["Vehicle Plate Number"].dropna():
+        plates += [x.strip() for x in str(v).split(";") if x.strip()]
+    ins = ws.max_row + 2
+    if plates:
+        ws[f"B{ins}"].value = "Vehicles"
         ws[f"B{ins}"].font = Font(size=9)
         ws[f"B{ins}"].border = border
         ws[f"B{ins}"].alignment = center
 
-        ws[f"B{ins+1}"].value = df["Company Full Name"].notna().sum()
+        ws[f"B{ins+1}"].value = ",".join(sorted(set(plates)))
         ws[f"B{ins+1}"].font = Font(size=9)
         ws[f"B{ins+1}"].border = border
         ws[f"B{ins+1}"].alignment = center
+        ins += 2
 
+    ws[f"B{ins}"].value = "Total Visitors"
+    ws[f"B{ins}"].font = Font(size=9)
+    ws[f"B{ins}"].border = border
+    ws[f"B{ins}"].alignment = center
+
+    ws[f"B{ins+1}"].value = df["Company Full Name"].notna().sum()
+    ws[f"B{ins+1}"].font = Font(size=9)
+    ws[f"B{ins+1}"].border = border
+    ws[f"B{ins+1}"].alignment = center
+
+    # Save full workbook (all sheets) to buffer
+    wb.save(buf)
     buf.seek(0)
     return buf
 
@@ -472,7 +470,7 @@ if uploaded:
     )
 
     cleaned = clean_data(raw_df)
-    out_buf = generate_visitor_only(cleaned, uploaded)  # ✅ pass uploaded file
+    out_buf = generate_visitor_only(cleaned, uploaded)  # pass uploaded file
 
     today_str = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y%m%d")
     fname = f"{company}_{today_str}.xlsx"
